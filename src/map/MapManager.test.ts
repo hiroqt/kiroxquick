@@ -1,0 +1,559 @@
+// src/map/MapManager.test.ts
+//
+// Unit tests for MapManager's non-rendering lifecycle logic. A fake map is
+// injected via `mapFactory` so none of this exercises a real WebGL map (the
+// test environment is jsdom, which has no WebGL). Requirements 1.2, 1.3, 1.6,
+// 5.2, 5.3, 5.5.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  MapManager,
+  TILE_WATCHDOG_MS,
+  type MapConstructorOptions,
+  type MinimalMap,
+} from './MapManager';
+import {
+  METRO_MANILA_EXTENT,
+  isWithinMetroManila,
+} from './metroManilaExtent';
+import {
+  BAHAROUTE_MAPBOX_STYLE_URL,
+  STYLE_MAX_ZOOM,
+  STYLE_MIN_ZOOM,
+} from './basemap/BahaRouteStyle';
+import {
+  OVERVIEW_BOUNDS,
+  OVERVIEW_DESKTOP_CENTER,
+  OVERVIEW_DESKTOP_ZOOM,
+  overviewFitOptions,
+} from '../camera/overviewFraming';
+import type { AppConfig } from '../types/config';
+
+const CONFIG: AppConfig = { tileKey: 'test-key-123', hasTileKey: true };
+
+/** A fake MinimalMap whose event listeners can be triggered from tests. */
+interface FakeMap extends MinimalMap {
+  /** Emits an event to all registered listeners (mimics Mapbox GL JS's `on`). */
+  emit(type: string, ...args: unknown[]): void;
+  /** Captured constructor options passed to the factory. */
+  __options: MapConstructorOptions;
+  on: ReturnType<typeof vi.fn>;
+  off: ReturnType<typeof vi.fn>;
+  remove: ReturnType<typeof vi.fn>;
+  resize: ReturnType<typeof vi.fn>;
+  fitBounds: ReturnType<typeof vi.fn>;
+  getZoom: ReturnType<typeof vi.fn>;
+  setZoom: ReturnType<typeof vi.fn>;
+}
+
+/** Builds a fake map + a factory that returns it, tracking listeners/zoom. */
+function makeFake(initialZoom = 12): {
+  map: FakeMap;
+  factory: (o: MapConstructorOptions) => MinimalMap;
+} {
+  const listeners = new Map<string, Array<(...a: unknown[]) => void>>();
+  let zoom = initialZoom;
+
+  const map = {
+    __options: undefined as unknown as MapConstructorOptions,
+    on: vi.fn((type: string, listener: (...a: unknown[]) => void) => {
+      const arr = listeners.get(type) ?? [];
+      arr.push(listener);
+      listeners.set(type, arr);
+    }),
+    off: vi.fn((type: string, listener: (...a: unknown[]) => void) => {
+      const arr = listeners.get(type) ?? [];
+      listeners.set(
+        type,
+        arr.filter((l) => l !== listener),
+      );
+    }),
+    remove: vi.fn(),
+    resize: vi.fn(),
+    fitBounds: vi.fn(),
+    getZoom: vi.fn(() => zoom),
+    setZoom: vi.fn((z: number) => {
+      zoom = z;
+    }),
+    emit(type: string, ...args: unknown[]) {
+      for (const l of listeners.get(type) ?? []) l(...args);
+    },
+  } as unknown as FakeMap;
+
+  const factory = (o: MapConstructorOptions): MinimalMap => {
+    map.__options = o;
+    return map;
+  };
+
+  return { map, factory };
+}
+
+describe('MapManager.init framing (Req 1.2, 1.3)', () => {
+  it('constructs the map with the stock Mapbox style URL, style zoom bounds, and the config token', () => {
+    const { map, factory } = makeFake();
+    const mgr = new MapManager();
+    const container = document.createElement('div');
+
+    mgr.init({ container, config: CONFIG, mapFactory: factory });
+
+    expect(map.__options.style).toBe(BAHAROUTE_MAPBOX_STYLE_URL);
+    expect(map.__options.minZoom).toBe(STYLE_MIN_ZOOM);
+    expect(map.__options.maxZoom).toBe(STYLE_MAX_ZOOM);
+    expect(map.__options.container).toBe(container);
+    // The Mapbox access token flows from AppConfig.tileKey (env), never hardcoded.
+    expect(map.__options.accessToken).toBe(CONFIG.tileKey);
+    // No hard clip: the constructor sets center/zoom, not maxBounds.
+    expect(
+      (map.__options as unknown as { maxBounds?: unknown }).maxBounds,
+    ).toBeUndefined();
+
+    mgr.destroy();
+  });
+
+  it('frames a first-paint center that is inside the NCR at a zoom within the style bounds', () => {
+    const { map, factory } = makeFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    const [centerLng, centerLat] = map.__options.center;
+    expect(isWithinMetroManila(centerLng, centerLat)).toBe(true);
+    expect(map.__options.zoom).toBeGreaterThanOrEqual(STYLE_MIN_ZOOM);
+    expect(map.__options.zoom).toBeLessThanOrEqual(STYLE_MAX_ZOOM);
+
+    mgr.destroy();
+  });
+});
+
+describe('MapManager tile watchdog (Req 1.6)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('fires onTileFailure after 15s when no load event arrives', () => {
+    const { factory } = makeFake();
+    const onReady = vi.fn();
+    const onTileFailure = vi.fn();
+    const mgr = new MapManager();
+
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      onReady,
+      onTileFailure,
+      mapFactory: factory,
+    });
+
+    expect(onTileFailure).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(TILE_WATCHDOG_MS);
+
+    expect(onTileFailure).toHaveBeenCalledTimes(1);
+    expect(onTileFailure).toHaveBeenCalledWith('timeout');
+    expect(onReady).not.toHaveBeenCalled();
+
+    mgr.destroy();
+  });
+
+  it('does NOT fire onTileFailure when a load event arrives first, and fires onReady once', () => {
+    const { map, factory } = makeFake();
+    const onReady = vi.fn();
+    const onTileFailure = vi.fn();
+    const mgr = new MapManager();
+
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      onReady,
+      onTileFailure,
+      mapFactory: factory,
+    });
+
+    map.emit('load');
+    expect(onReady).toHaveBeenCalledTimes(1);
+
+    // Advancing past the watchdog window must not trigger a failure: the
+    // watchdog was cleared on success and the outcome fires at most once.
+    vi.advanceTimersByTime(TILE_WATCHDOG_MS * 2);
+    expect(onTileFailure).not.toHaveBeenCalled();
+    expect(onReady).toHaveBeenCalledTimes(1);
+
+    mgr.destroy();
+  });
+
+  it('fires onTileFailure once on an error event and not again on timeout', () => {
+    const { map, factory } = makeFake();
+    const onTileFailure = vi.fn();
+    const mgr = new MapManager();
+
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      onTileFailure,
+      mapFactory: factory,
+    });
+
+    map.emit('error', new Error('tile boom'));
+    expect(onTileFailure).toHaveBeenCalledTimes(1);
+    expect(onTileFailure).toHaveBeenCalledWith('error');
+
+    vi.advanceTimersByTime(TILE_WATCHDOG_MS * 2);
+    expect(onTileFailure).toHaveBeenCalledTimes(1);
+
+    mgr.destroy();
+  });
+
+  it('does not fire onReady after destroy even if the watchdog would have elapsed', () => {
+    const { factory } = makeFake();
+    const onTileFailure = vi.fn();
+    const mgr = new MapManager();
+
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      onTileFailure,
+      mapFactory: factory,
+    });
+
+    mgr.destroy();
+    vi.advanceTimersByTime(TILE_WATCHDOG_MS * 2);
+    expect(onTileFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe('MapManager.destroy releases resources', () => {
+  it('removes the map, detaches listeners, and clears the watchdog', () => {
+    vi.useFakeTimers();
+    const { map, factory } = makeFake();
+    const onTileFailure = vi.fn();
+    const mgr = new MapManager();
+
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      onTileFailure,
+      mapFactory: factory,
+    });
+
+    mgr.destroy();
+
+    expect(map.remove).toHaveBeenCalledTimes(1);
+    expect(map.off).toHaveBeenCalledWith('load', expect.any(Function));
+    expect(map.off).toHaveBeenCalledWith('error', expect.any(Function));
+    expect(mgr.getMap()).toBeNull();
+
+    // Timer cleared: advancing does not invoke the failure callback.
+    vi.advanceTimersByTime(TILE_WATCHDOG_MS * 2);
+    expect(onTileFailure).not.toHaveBeenCalled();
+
+    // destroy is idempotent.
+    expect(() => mgr.destroy()).not.toThrow();
+    expect(map.remove).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('disconnects the ResizeObserver when available', () => {
+    const disconnect = vi.fn();
+    const observe = vi.fn();
+    const originalRO = globalThis.ResizeObserver;
+    // Provide a fake ResizeObserver for this test.
+    globalThis.ResizeObserver = vi.fn(() => ({
+      observe,
+      disconnect,
+      unobserve: vi.fn(),
+    })) as unknown as typeof ResizeObserver;
+
+    try {
+      const { factory } = makeFake();
+      const mgr = new MapManager();
+      const container = document.createElement('div');
+      mgr.init({ container, config: CONFIG, mapFactory: factory });
+
+      expect(observe).toHaveBeenCalledWith(container);
+      mgr.destroy();
+      expect(disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.ResizeObserver = originalRO;
+    }
+  });
+
+  it('resizes the map when the ResizeObserver fires', () => {
+    let capturedCallback: (() => void) | undefined;
+    const originalRO = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = vi.fn((cb: () => void) => {
+      capturedCallback = cb;
+      return { observe: vi.fn(), disconnect: vi.fn(), unobserve: vi.fn() };
+    }) as unknown as typeof ResizeObserver;
+
+    try {
+      const { map, factory } = makeFake();
+      const mgr = new MapManager();
+      mgr.init({
+        container: document.createElement('div'),
+        config: CONFIG,
+        mapFactory: factory,
+      });
+
+      capturedCallback?.();
+      expect(map.resize).toHaveBeenCalled();
+      mgr.destroy();
+    } finally {
+      globalThis.ResizeObserver = originalRO;
+    }
+  });
+});
+
+describe('MapManager zoom clamping (Req 5.2, 5.5)', () => {
+  it('clampZoom keeps values within [min, max]', () => {
+    const { factory } = makeFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    expect(mgr.clampZoom(STYLE_MAX_ZOOM + 5)).toBe(STYLE_MAX_ZOOM);
+    expect(mgr.clampZoom(STYLE_MIN_ZOOM - 5)).toBe(STYLE_MIN_ZOOM);
+    expect(mgr.clampZoom(12)).toBe(12);
+    expect(mgr.clampZoom(Number.NaN)).toBe(STYLE_MIN_ZOOM);
+
+    mgr.destroy();
+  });
+
+  it('zoomIn / zoomOut / setZoomClamped never exceed the style bounds', () => {
+    const { map, factory } = makeFake(STYLE_MAX_ZOOM);
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    // Already at max: zooming in stays clamped at max.
+    mgr.zoomIn();
+    expect(map.setZoom).toHaveBeenLastCalledWith(STYLE_MAX_ZOOM);
+
+    // Explicit over-max request is clamped.
+    mgr.setZoomClamped(STYLE_MAX_ZOOM + 10);
+    expect(map.setZoom).toHaveBeenLastCalledWith(STYLE_MAX_ZOOM);
+
+    // Drive below min: clamps to min.
+    mgr.setZoomClamped(STYLE_MIN_ZOOM); // getZoom now returns min
+    mgr.zoomOut();
+    expect(map.setZoom).toHaveBeenLastCalledWith(STYLE_MIN_ZOOM);
+
+    mgr.destroy();
+  });
+});
+
+describe('MapManager.recenter (Req 7.2)', () => {
+  it('fitBounds back to METRO_MANILA_EXTENT within the animation budget', () => {
+    const { map, factory } = makeFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    mgr.recenter();
+    expect(map.fitBounds).toHaveBeenCalledWith(
+      METRO_MANILA_EXTENT,
+      expect.objectContaining({ duration: expect.any(Number) }),
+    );
+    const [, options] = map.fitBounds.mock.calls[0] as [
+      unknown,
+      { duration: number },
+    ];
+    expect(options.duration).toBeLessThanOrEqual(1000);
+
+    mgr.destroy();
+  });
+});
+
+// --- Task 2 camera extensions (Req 1.2, 10.5) ------------------------------
+//
+// These fakes extend the minimal map with the optional camera methods so we can
+// assert MapManager delegates with the exact args, and separately prove that a
+// map OMITTING those methods keeps the delegates a safe no-op (never throws).
+
+/** A fake map that ADDS the optional camera methods as spies. */
+interface CameraFakeMap extends FakeMap {
+  flyTo: ReturnType<typeof vi.fn>;
+  easeTo: ReturnType<typeof vi.fn>;
+  setPitch: ReturnType<typeof vi.fn>;
+  setBearing: ReturnType<typeof vi.fn>;
+}
+
+/** Builds a fake with camera methods present + a factory returning it. */
+function makeCameraFake(): {
+  map: CameraFakeMap;
+  factory: (o: MapConstructorOptions) => MinimalMap;
+} {
+  const { map, factory } = makeFake();
+  const cameraMap = map as CameraFakeMap;
+  cameraMap.flyTo = vi.fn();
+  cameraMap.easeTo = vi.fn();
+  cameraMap.setPitch = vi.fn();
+  cameraMap.setBearing = vi.fn();
+  return { map: cameraMap, factory };
+}
+
+describe('MapManager camera extensions (Req 1.2, 10.5)', () => {
+  it('delegates flyTo/easeTo/setPitch/setBearing to the underlying map with the right args', () => {
+    const { map, factory } = makeCameraFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    const flyOptions = { center: [121, 14.6], zoom: 17 };
+    const easeOptions = { pitch: 50, duration: 500 };
+    mgr.flyTo(flyOptions);
+    mgr.easeTo(easeOptions);
+    mgr.setPitch(45);
+    mgr.setBearing(90);
+
+    expect(map.flyTo).toHaveBeenCalledTimes(1);
+    expect(map.flyTo).toHaveBeenCalledWith(flyOptions);
+    expect(map.easeTo).toHaveBeenCalledTimes(1);
+    expect(map.easeTo).toHaveBeenCalledWith(easeOptions);
+    expect(map.setPitch).toHaveBeenCalledTimes(1);
+    expect(map.setPitch).toHaveBeenCalledWith(45);
+    expect(map.setBearing).toHaveBeenCalledTimes(1);
+    expect(map.setBearing).toHaveBeenCalledWith(90);
+
+    mgr.destroy();
+  });
+
+  it('is a safe no-op when the underlying map omits the camera methods', () => {
+    // makeFake() produces a minimal map WITHOUT flyTo/easeTo/setPitch/setBearing.
+    const { factory } = makeFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    expect(() => mgr.flyTo({ center: [121, 14.6] })).not.toThrow();
+    expect(() => mgr.easeTo({ pitch: 50 })).not.toThrow();
+    expect(() => mgr.setPitch(45)).not.toThrow();
+    expect(() => mgr.setBearing(90)).not.toThrow();
+
+    mgr.destroy();
+  });
+
+  it('is a safe no-op before init and after destroy', () => {
+    const mgr = new MapManager();
+    // Before init: map is null.
+    expect(() => mgr.flyTo({})).not.toThrow();
+    expect(() => mgr.easeTo({})).not.toThrow();
+    expect(() => mgr.setPitch(0)).not.toThrow();
+    expect(() => mgr.setBearing(0)).not.toThrow();
+    expect(() => mgr.frameOverview()).not.toThrow();
+
+    const { factory } = makeCameraFake();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+    mgr.destroy();
+
+    // After destroy: map is null again.
+    expect(() => mgr.flyTo({})).not.toThrow();
+    expect(() => mgr.frameOverview()).not.toThrow();
+  });
+});
+
+/**
+ * Stamps fixed clientWidth/clientHeight onto an element so jsdom (which reports
+ * 0 for both by default) can simulate a laid-out container of a given size.
+ */
+function sizedContainer(width: number, height: number): HTMLElement {
+  const el = document.createElement('div');
+  Object.defineProperty(el, 'clientWidth', { value: width, configurable: true });
+  Object.defineProperty(el, 'clientHeight', {
+    value: height,
+    configurable: true,
+  });
+  return el;
+}
+
+describe('MapManager.frameOverview (Req 1.2)', () => {
+  it('falls back to fitBounds(OVERVIEW_BOUNDS) when the container has no measurable size', () => {
+    // The default jsdom container reports clientWidth/clientHeight = 0, so
+    // frameOverview cannot measure an aspect ratio and keeps the proven
+    // fitBounds framing — this is also the mobile/minimal-fake path.
+    const { map, factory } = makeCameraFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: document.createElement('div'),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    mgr.frameOverview();
+
+    expect(map.fitBounds).toHaveBeenCalledWith(
+      OVERVIEW_BOUNDS,
+      overviewFitOptions(),
+    );
+    expect(map.easeTo).not.toHaveBeenCalled();
+
+    mgr.destroy();
+  });
+
+  it('on a WIDE desktop container with easeTo present → easeTo(center=OVERVIEW_DESKTOP_CENTER, zoom=OVERVIEW_DESKTOP_ZOOM)', () => {
+    const { map, factory } = makeCameraFake();
+    const mgr = new MapManager();
+    // 1440x800 → aspect 1.8 (wide desktop) → centerZoom framing.
+    mgr.init({
+      container: sizedContainer(1440, 800),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    mgr.frameOverview();
+
+    expect(map.easeTo).toHaveBeenCalledTimes(1);
+    const [easeArg] = map.easeTo.mock.calls[0] as [
+      { center: [number, number]; zoom: number; duration: number },
+    ];
+    // Product framing: the tuned reference center + product zoom so the NCR
+    // reads large, close, and dominant.
+    expect(easeArg.center).toEqual(OVERVIEW_DESKTOP_CENTER);
+    expect(easeArg.zoom).toBe(OVERVIEW_DESKTOP_ZOOM);
+    expect(easeArg.zoom).toBeGreaterThanOrEqual(STYLE_MIN_ZOOM);
+    expect(easeArg.zoom).toBeLessThanOrEqual(STYLE_MAX_ZOOM);
+    expect(easeArg.duration).toBeLessThanOrEqual(1000);
+    // centerZoom path must NOT also call fitBounds.
+    expect(map.fitBounds).not.toHaveBeenCalled();
+
+    mgr.destroy();
+  });
+
+  it('on a WIDE desktop container WITHOUT easeTo → falls back to fitBounds without throwing', () => {
+    // makeFake() has no easeTo; give it a wide, measurable container.
+    const { map, factory } = makeFake();
+    const mgr = new MapManager();
+    mgr.init({
+      container: sizedContainer(1440, 800),
+      config: CONFIG,
+      mapFactory: factory,
+    });
+
+    expect(() => mgr.frameOverview()).not.toThrow();
+    expect(map.fitBounds).toHaveBeenCalledWith(
+      OVERVIEW_BOUNDS,
+      overviewFitOptions(),
+    );
+
+    mgr.destroy();
+  });
+});

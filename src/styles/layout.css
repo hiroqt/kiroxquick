@@ -1,0 +1,222 @@
+/*
+ * src/styles/layout.css — Responsive layout for BahaRoute (Task 16).
+ *
+ * Implements the design "Responsive layout strategy" around a single 768px
+ * breakpoint (Req 10):
+ *
+ *   - Mobile  (< 768px): all interactive controls live in the LOWER TWO-THIRDS
+ *     of the viewport height, anchored to the bottom as a floating stack /
+ *     bottom-sheet so they are reachable by thumb (Req 10.1). Every touch
+ *     target is >= 44x44 CSS px (Req 10.4).
+ *   - Desktop (>= 768px): controls are anchored top-right and spaced so none
+ *     overlaps another and each is fully visible in the viewport (Req 10.2).
+ *   - Safe-area insets: env(safe-area-inset-*) padding keeps controls out of a
+ *     device notch / system-bar region (Req 10.3). Requires
+ *     <meta name="viewport" ... viewport-fit=cover> (present in index.html).
+ *
+ * Placement is driven by a CSS custom-property token set that SWITCHES at the
+ * 768px media query (design → "a CSS custom-property token set switches control
+ * placement at the 768px media query"). The default (mobile-first) token set
+ * anchors to the bottom; the >= 768px media query flips the tokens to the
+ * top-right cluster. MapView applies the `.baharoute-controls` class instead of
+ * hardcoded inline positioning.
+ */
+
+/* ----------------------------------------------------------------------------
+ * Placement tokens (mobile-first defaults: lower two-thirds, bottom-anchored).
+ * These are the tokens that the 768px media query overrides for desktop.
+ * ------------------------------------------------------------------------- */
+:root {
+  /* Safe-area insets (0 where unsupported), used by control padding. */
+  --baharoute-safe-top: env(safe-area-inset-top, 0px);
+  --baharoute-safe-right: env(safe-area-inset-right, 0px);
+  --baharoute-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --baharoute-safe-left: env(safe-area-inset-left, 0px);
+
+  /* Minimum interactive touch target (Req 10.4). */
+  --baharoute-touch-target: 44px;
+
+  /* Spacing between stacked controls so none overlaps another. */
+  --baharoute-control-gap: 12px;
+  --baharoute-control-inset: 12px;
+
+  /*
+   * Control placement tokens — MOBILE defaults.
+   * Anchor the control cluster to the bottom so it sits within the lower
+   * two-thirds of the viewport height (Req 10.1). `top: auto` releases the top
+   * edge; `max-height: 66vh` keeps the cluster inside the lower two-thirds.
+   */
+  --baharoute-controls-top: auto;
+  --baharoute-controls-right: var(--baharoute-control-inset);
+  --baharoute-controls-bottom: var(--baharoute-control-inset);
+  --baharoute-controls-left: var(--baharoute-control-inset);
+  --baharoute-controls-max-height: 66vh;
+  --baharoute-controls-align: stretch;
+  --baharoute-controls-flex-direction: column;
+}
+
+/* ----------------------------------------------------------------------------
+ * App shell + dominant map area: full-viewport map, controls overlaid.
+ * ------------------------------------------------------------------------- */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.baharoute-app {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 100vh;
+}
+
+/* The map area is dominant: it fills the remaining space and the controls are
+ * absolutely positioned overlays on top of it. */
+.baharoute-map-view {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+
+.baharoute-map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ----------------------------------------------------------------------------
+ * Control cluster — positioned entirely from the placement tokens above, so a
+ * single media query re-anchors it. On mobile these tokens anchor to the bottom
+ * (lower two-thirds); on desktop the media query flips them to top-right.
+ * ------------------------------------------------------------------------- */
+.baharoute-controls {
+  position: absolute;
+  top: var(--baharoute-controls-top);
+  right: var(--baharoute-controls-right);
+  bottom: var(--baharoute-controls-bottom);
+  left: var(--baharoute-controls-left);
+
+  display: flex;
+  flex-direction: var(--baharoute-controls-flex-direction);
+  align-items: var(--baharoute-controls-align);
+  gap: var(--baharoute-control-gap);
+
+  /* Keep the cluster within the lower two-thirds and scrollable if it grows. */
+  max-height: var(--baharoute-controls-max-height);
+  overflow: auto;
+
+  z-index: 2;
+
+  /* Safe-area padding so no control renders inside a notch / system bar
+   * (Req 10.3). Adds the device inset on top of the base inset. */
+  padding-top: var(--baharoute-safe-top);
+  padding-right: var(--baharoute-safe-right);
+  padding-bottom: var(--baharoute-safe-bottom);
+  padding-left: var(--baharoute-safe-left);
+
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+/* Only the actual controls receive pointer events; the cluster wrapper is a
+ * pass-through so it never blocks map interaction in its empty regions. */
+.baharoute-controls > * {
+  pointer-events: auto;
+}
+
+/* Reinforce the >= 44x44 CSS px touch target on interactive controls, in
+ * addition to the inline sizing already on the buttons (Req 10.4). */
+.baharoute-controls button,
+.baharoute-controls [role='button'] {
+  min-width: var(--baharoute-touch-target);
+  min-height: var(--baharoute-touch-target);
+}
+
+/* ----------------------------------------------------------------------------
+ * Desktop breakpoint (>= 768px): flip the placement tokens so the cluster is a
+ * spaced top-right column. Anchoring to a single corner with a gap guarantees
+ * no control overlaps another and each is fully visible (Req 10.2).
+ * ------------------------------------------------------------------------- */
+@media (min-width: 768px) {
+  :root {
+    --baharoute-controls-top: var(--baharoute-control-inset);
+    --baharoute-controls-right: var(--baharoute-control-inset);
+    --baharoute-controls-bottom: auto;
+    --baharoute-controls-left: auto;
+    --baharoute-controls-max-height: none;
+    --baharoute-controls-align: flex-end;
+    --baharoute-controls-flex-direction: column;
+  }
+
+  .baharoute-controls {
+    /* On desktop the cluster hugs its content at the top-right rather than
+     * stretching across the bottom. */
+    width: auto;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * Accessibility hardening — visible focus indicator (Task 17, Req 11.2).
+ *
+ * Every interactive control carries the `.baharoute-focus-ring` class hook. When
+ * such a control receives keyboard focus, it renders a clearly visible focus
+ * outline drawn in a DEDICATED focus-ring color token (`--baharoute-focus-ring-color`).
+ *
+ * The token is a strong, high-chroma blue chosen so the outline boundary has a
+ * contrast ratio of at least 3:1 against the light control backgrounds it sits
+ * on (Req 11.2). It is deliberately separate from the muted basemap palette and
+ * from the reserved flood palette so it is never confused with map content.
+ *
+ * We prefer :focus-visible (keyboard / programmatic focus, not mouse click) but
+ * provide a plain :focus fallback for engines/tests that do not implement
+ * :focus-visible, so the ring is always visible on keyboard focus. The outline
+ * uses an offset so the ring sits clearly outside the control edge, and a
+ * matching box-shadow "halo" reinforces visibility on controls whose own border
+ * would otherwise sit close to the outline.
+ *
+ * NOTE: This covers the programmatic + visual foundation only. Full WCAG 2.1 AA
+ * conformance (including measured contrast against every real rendered
+ * background and behavior with real assistive technology) still requires manual
+ * AT review and expert verification (design → Accessibility strategy).
+ * ------------------------------------------------------------------------- */
+:root {
+  /* Dedicated focus-ring color (Req 11.2). Strong blue, >= 3:1 against the
+   * light (near-white) control surfaces used by the controls. */
+  --baharoute-focus-ring-color: #1a56db;
+  /* Focus outline geometry. */
+  --baharoute-focus-ring-width: 3px;
+  --baharoute-focus-ring-offset: 2px;
+}
+
+/* :focus fallback — always show the ring on focus for engines without
+ * :focus-visible support (and for the test environment). */
+.baharoute-focus-ring:focus {
+  outline: var(--baharoute-focus-ring-width) solid
+    var(--baharoute-focus-ring-color);
+  outline-offset: var(--baharoute-focus-ring-offset);
+  /* Reinforcing halo so the boundary stays visible even where the control's own
+   * border sits near the outline. */
+  box-shadow: 0 0 0 var(--baharoute-focus-ring-offset)
+    var(--baharoute-focus-ring-color);
+}
+
+/* :focus-visible — the preferred path. Suppress the plain-:focus ring for mouse
+ * users on engines that support :focus-visible, while keeping it for keyboard
+ * focus. */
+.baharoute-focus-ring:focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
+
+.baharoute-focus-ring:focus-visible {
+  outline: var(--baharoute-focus-ring-width) solid
+    var(--baharoute-focus-ring-color);
+  outline-offset: var(--baharoute-focus-ring-offset);
+  box-shadow: 0 0 0 var(--baharoute-focus-ring-offset)
+    var(--baharoute-focus-ring-color);
+}
